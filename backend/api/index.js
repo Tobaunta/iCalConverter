@@ -41,7 +41,6 @@ app.post("/generate", async (req, res) => {
   if (!url) {
     return res.status(400).json({ error: "URL saknas" });
   }
-
   try {
     const effectiveSummary = summary || "Jobb";
     const savedUrl = await saveOrUpdateICalUrl(url, effectiveSummary);
@@ -95,6 +94,30 @@ app.get("/calendar/:id", async (req, res) => {
   }
 });
 
+app.get("/update-calendars", async (req, res) => {
+  try {
+    const apiKey = req.query.apiKey;
+    const configuredApiKey = process.env.UPDATE_API_KEY;
+
+    if (configuredApiKey && apiKey !== configuredApiKey) {
+      return res.status(401).json({ error: "Ogiltig API-nyckel" });
+    }
+    await updateAllICalUrls();
+    res.json({
+      status: "success",
+      message: "Alla kalendrar har uppdaterats",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Fel vid uppdatering av kalendrar:", error);
+    res.status(500).json({
+      error: "Ett fel inträffade vid uppdatering av kalendrar",
+      message: error.message,
+      stack: process.env.NODE_ENV === "production" ? undefined : error.stack,
+    });
+  }
+});
+
 if (process.env.NODE_ENV !== "production") {
   app.listen(PORT, () => {
     console.log(`Servern lyssnar på http://localhost:${PORT}`);
@@ -105,6 +128,10 @@ if (process.env.NODE_ENV !== "production") {
         console.error("Fel vid uppdatering av iCal URLs:", error);
       }
     }, UPDATE_INTERVAL);
+  });
+} else {
+  app.listen(PORT, () => {
+    console.log(`Servern lyssnar på port ${PORT} i produktionsmiljö`);
   });
 }
 
