@@ -169,9 +169,26 @@ export async function getICalUrl(uniqueId) {
 
 export async function updateAllICalUrls() {
   try {
+    // Importera updateStatus från index.js om det finns tillgängligt
+    let updateStatus;
+    try {
+      const { updateStatus: importedStatus } = await import("../api/index.js");
+      updateStatus = importedStatus;
+    } catch (importError) {
+      console.log(
+        "Kunde inte importera updateStatus, fortsätter utan statusuppdatering"
+      );
+    }
+
     const urls = await ICalUrl.find();
+    console.log(`Uppdaterar ${urls.length} kalendrar...`);
+
+    // Uppdatera en kalender i taget för att undvika att överbelasta systemet
     for (const url of urls) {
       try {
+        console.log(
+          `Uppdaterar kalender: ${url.uniqueId} (${url.originalUrl})`
+        );
         const data = await fetchICalData(url.originalUrl);
         const processedData = processICalData(data, url.summary || "Jobb");
         const icalContent = createICalFile(
@@ -182,10 +199,24 @@ export async function updateAllICalUrls() {
         url.icalContent = icalContent;
         url.lastUpdated = new Date().toISOString();
         await ICalUrl.save(url);
+        console.log(`Uppdatering slutförd för kalender: ${url.uniqueId}`);
       } catch (error) {
         console.error(`Fel vid uppdatering av ${url.originalUrl}:`, error);
       }
+
+      // Lägg till en kort paus mellan varje kalenderuppdatering för att undvika att överbelasta systemet
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
+
+    // Uppdatera status om det är tillgängligt
+    if (updateStatus) {
+      updateStatus.isUpdating = false;
+      updateStatus.lastUpdateCompleted = new Date().toISOString();
+      updateStatus.error = null;
+    }
+
+    console.log("Alla kalendrar har uppdaterats");
+    return { success: true, count: urls.length };
   } catch (error) {
     console.error("Fel vid uppdatering av alla iCal URLs:", error);
     throw new Error(`Kunde inte uppdatera alla iCal URLs: ${error.message}`);

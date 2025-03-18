@@ -94,6 +94,14 @@ app.get("/calendar/:id", async (req, res) => {
   }
 });
 
+// Lägg till en global variabel för att hålla koll på uppdateringsstatus
+export const updateStatus = {
+  isUpdating: false,
+  lastUpdateStarted: null,
+  lastUpdateCompleted: null,
+  error: null,
+};
+
 app.get("/update-calendars", async (req, res) => {
   try {
     const apiKey = req.query.apiKey;
@@ -102,10 +110,39 @@ app.get("/update-calendars", async (req, res) => {
     if (configuredApiKey && apiKey !== configuredApiKey) {
       return res.status(401).json({ error: "Ogiltig API-nyckel" });
     }
-    await updateAllICalUrls();
+
+    // Kontrollera om en uppdatering redan pågår
+    if (updateStatus.isUpdating) {
+      return res.json({
+        status: "already_running",
+        message: "En uppdatering pågår redan",
+        startedAt: updateStatus.lastUpdateStarted,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Uppdatera status
+    updateStatus.isUpdating = true;
+    updateStatus.lastUpdateStarted = new Date().toISOString();
+    updateStatus.error = null;
+
+    // Starta uppdateringsprocessen i bakgrunden utan att vänta på att den slutförs
+    const updatePromise = updateAllICalUrls()
+      .then(() => {
+        updateStatus.isUpdating = false;
+        updateStatus.lastUpdateCompleted = new Date().toISOString();
+        updateStatus.error = null;
+      })
+      .catch((error) => {
+        console.error("Fel vid bakgrundsuppdatering av kalendrar:", error);
+        updateStatus.error = error;
+        updateStatus.isUpdating = false;
+      });
+
+    // Returnera direkt med ett svar att uppdateringen har påbörjats
     res.json({
-      status: "success",
-      message: "Alla kalendrar har uppdaterats",
+      status: "started",
+      message: "Uppdatering av kalendrar har påbörjats",
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -118,14 +155,44 @@ app.get("/update-calendars", async (req, res) => {
   }
 });
 
+app.get("/update-status", async (req, res) => {
+  try {
+    const apiKey = req.query.apiKey;
+    const configuredApiKey = process.env.UPDATE_API_KEY;
+
+    if (configuredApiKey && apiKey !== configuredApiKey) {
+      return res.status(401).json({ error: "Ogiltig API-nyckel" });
+    }
+
+    res.json({
+      ...updateStatus,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Fel vid hämtning av uppdateringsstatus:", error);
+    res.status(500).json({
+      error: "Ett fel inträffade vid hämtning av uppdateringsstatus",
+      message: error.message,
+      stack: process.env.NODE_ENV === "production" ? undefined : error.stack,
+    });
+  }
+});
+
 if (process.env.NODE_ENV !== "production") {
   app.listen(PORT, () => {
     console.log(`Servern lyssnar på http://localhost:${PORT}`);
     setInterval(async () => {
       try {
+        updateStatus.isUpdating = true;
+        updateStatus.lastUpdateStarted = new Date().toISOString();
         await updateAllICalUrls();
+        updateStatus.isUpdating = false;
+        updateStatus.lastUpdateCompleted = new Date().toISOString();
+        updateStatus.error = null;
       } catch (error) {
         console.error("Fel vid uppdatering av iCal URLs:", error);
+        updateStatus.error = error;
+        updateStatus.isUpdating = false;
       }
     }, UPDATE_INTERVAL);
   });
