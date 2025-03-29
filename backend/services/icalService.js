@@ -1,13 +1,17 @@
 import axios from "axios";
 import ICAL from "ical.js";
 import crypto from "crypto";
-import { put, list } from "@vercel/blob";
+import { put, list, del } from "@vercel/blob";
 
 // Hjälpfunktion för att vänta mellan retry-försök
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function fetchICalData(url) {
   try {
+    if (!url) {
+      throw new Error("Ingen URL angiven för kalendern");
+    }
+
     let modifiedUrl = url;
     if (url.startsWith("webcals://")) {
       modifiedUrl = url.replace("webcals://", "https://");
@@ -25,6 +29,9 @@ export async function fetchICalData(url) {
     return response.data;
   } catch (error) {
     console.error("Fel vid hämtning av iCal-data:", error.message);
+    if (!url) {
+      throw new Error("Ingen URL angiven för kalendern");
+    }
     throw error;
   }
 }
@@ -116,33 +123,57 @@ export function createICalFile(dailyEvents, summary = "Jobb") {
 }
 
 export async function updateAllICalUrls() {
-  try {
-    console.log("Hämtar alla kalendrar från Vercel Blob...");
-    const { blobs } = await list();
-    const calendarBlobs = blobs.filter((blob) =>
-      blob.pathname.endsWith(".json")
-    );
-    console.log(`Hittade ${calendarBlobs.length} kalendrar att uppdatera`);
+  console.log("Startar uppdatering av alla iCal-URLs");
+  const results = [];
 
-    const results = [];
-    for (const blob of calendarBlobs) {
+  try {
+    const { blobs } = await list({ prefix: "icalurl-" });
+
+    for (const blob of blobs) {
       try {
-        console.log(`Hämtar data för kalender: ${blob.pathname}`);
+        console.log(`Behandlar blob: ${blob.pathname}`);
         const response = await axios.get(blob.url);
         const calendarData = response.data;
 
-        if (!calendarData || !calendarData.originalUrl) {
-          console.error(`Ogiltig kalenderdata för ${blob.pathname}`);
+        // Logga kalenderdata för felsökning
+        console.log("Kalenderdata:", JSON.stringify(calendarData, null, 2));
+
+        // Kontrollera olika möjliga URL-fält
+        const calendarUrl =
+          calendarData?.url ||
+          calendarData?.originalUrl ||
+          calendarData?.icalUrl;
+
+        if (!calendarData || !calendarUrl) {
+          console.error(
+            `Ogiltig kalenderdata för ${
+              blob.pathname
+            }: Saknar URL. Tillgängliga fält: ${Object.keys(
+              calendarData || {}
+            ).join(", ")}`
+          );
           results.push({
             pathname: blob.pathname,
             success: false,
-            error: "Ogiltig kalenderdata",
+            error: `Ogiltig kalenderdata: Saknar URL. Tillgängliga fält: ${Object.keys(
+              calendarData || {}
+            ).join(", ")}`,
           });
           continue;
         }
 
-        // Hämta och bearbeta ny kalenderdata
-        const data = await fetchICalData(calendarData.originalUrl);
+        // Hämta och bearbeta iCal-data
+        const data = await fetchICalData(calendarUrl);
+        if (!data) {
+          console.error(`Kunde inte hämta data för ${calendarUrl}`);
+          results.push({
+            pathname: blob.pathname,
+            success: false,
+            error: "Kunde inte hämta iCal-data",
+          });
+          continue;
+        }
+
         const processedData = processICalData(
           data,
           calendarData.summary || "Jobb"
@@ -152,14 +183,35 @@ export async function updateAllICalUrls() {
           calendarData.summary || "Jobb"
         );
 
+        // Ta bort gamla filer först
+        const allBlobs = await list();
+        const oldBlobs = allBlobs.blobs.filter(
+          (b) =>
+            b.pathname.includes(calendarData.uniqueId) &&
+            (b.pathname.endsWith(".json") || b.pathname.endsWith(".ics"))
+        );
+
+        // Ta bort gamla versioner
+        await Promise.all(
+          oldBlobs.map(async (oldBlob) => {
+            try {
+              console.log(`Tar bort gammal blob: ${oldBlob.url}`);
+              await del(oldBlob.url);
+            } catch (error) {
+              console.error(`Failed to delete old blob: ${oldBlob.url}`, error);
+            }
+          })
+        );
+
         // Spara den uppdaterade kalenderfilen
-        const icsBlob = await put(calendarData.uniqueId + ".ics", icalContent, {
+        const icsBlob = await put(`${calendarData.uniqueId}.ics`, icalContent, {
           access: "public",
         });
 
         // Uppdatera metadata
         const updatedData = {
           ...calendarData,
+          url: calendarUrl, // Säkerställ att vi använder rätt URL-fält
           processedData,
           icalContent,
           blobUrl: icsBlob.url,
@@ -167,16 +219,22 @@ export async function updateAllICalUrls() {
         };
 
         // Spara uppdaterad metadata
-        await put(blob.pathname, JSON.stringify(updatedData, null, 2), {
-          access: "public",
-        });
+        const jsonResult = await put(
+          blob.pathname,
+          JSON.stringify(updatedData, null, 2),
+          {
+            access: "public",
+          }
+        );
 
         results.push({
-          pathname: blob.pathname,
+          pathname: jsonResult.pathname,
           success: true,
         });
       } catch (error) {
-        console.error(`Fel vid uppdatering av ${blob.pathname}:`, error);
+        console.error(
+          `Fel vid uppdatering av ${blob.pathname}: ${error.message}`
+        );
         results.push({
           pathname: blob.pathname,
           success: false,
@@ -185,18 +243,10 @@ export async function updateAllICalUrls() {
       }
     }
 
-    return {
-      success: true,
-      message: "Uppdatering slutförd",
-      results,
-    };
+    return results;
   } catch (error) {
-    console.error("Fel vid uppdatering av kalendrar:", error);
-    throw {
-      success: false,
-      message: "Fel vid uppdatering av kalendrar",
-      error: error.message,
-    };
+    console.error("Fel vid uppdatering:", error);
+    throw error;
   }
 }
 

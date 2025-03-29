@@ -93,19 +93,18 @@ app.get("/update-calendars", async (req, res) => {
     }
 
     console.log("Startar uppdatering av kalendrar...");
-    const result = await updateAllICalUrls();
-
-    return res.json({
+    const results = await updateAllICalUrls();
+    res.json({
       status: "success",
-      message: result.message,
-      results: result.results,
+      message: "Uppdatering slutförd",
+      results,
     });
   } catch (error) {
     console.error("Fel vid uppdatering:", error);
-    return res.status(500).json({
+    res.status(500).json({
       status: "error",
-      message: error.message || "Ett fel uppstod vid uppdatering av kalendrar",
-      details: error.results || [],
+      message: "Fel vid uppdatering av kalendrar",
+      error: error.message,
     });
   }
 });

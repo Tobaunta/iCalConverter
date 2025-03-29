@@ -62,12 +62,26 @@ class ICalUrlModel {
       };
       const jsonContent = JSON.stringify(updatedDocument);
 
-      // Hämta alla existerande blobar med samma prefix
-      const { blobs } = await list({ prefix: this.prefix });
+      // Hämta alla existerande blobar
+      const { blobs } = await list();
 
-      // Hitta och ta bort gamla versioner av samma kalender
-      const oldBlobs = blobs.filter((blob) =>
-        blob.pathname.includes(document.uniqueId)
+      // Hitta och ta bort gamla versioner av samma kalender (både .json och .ics)
+      const oldBlobs = blobs.filter(
+        (blob) =>
+          blob.pathname.includes(document.uniqueId) &&
+          (blob.pathname.endsWith(".json") || blob.pathname.endsWith(".ics"))
+      );
+
+      // Ta bort gamla versioner först
+      await Promise.all(
+        oldBlobs.map(async (oldBlob) => {
+          try {
+            console.log(`Tar bort gammal blob: ${oldBlob.url}`);
+            await del(oldBlob.url);
+          } catch (error) {
+            console.error(`Failed to delete old blob: ${oldBlob.url}`, error);
+          }
+        })
       );
 
       // Spara ny version
@@ -75,15 +89,6 @@ class ICalUrlModel {
         contentType: "application/json",
         access: "public",
       });
-
-      // Ta bort gamla versioner
-      for (const oldBlob of oldBlobs) {
-        try {
-          await del(oldBlob.url);
-        } catch (error) {
-          console.error(`Failed to delete old blob: ${oldBlob.url}`, error);
-        }
-      }
 
       return result;
     } catch (error) {
