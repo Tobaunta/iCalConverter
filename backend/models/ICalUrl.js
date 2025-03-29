@@ -1,4 +1,4 @@
-import { put, list } from "@vercel/blob";
+import { put, list, del } from "@vercel/blob";
 
 class ICalUrlModel {
   constructor() {
@@ -61,26 +61,33 @@ class ICalUrlModel {
         lastUpdated: new Date().toISOString(),
       };
       const jsonContent = JSON.stringify(updatedDocument);
+
+      // Hämta alla existerande blobar med samma prefix
+      const { blobs } = await list({ prefix: this.prefix });
+
+      // Hitta och ta bort gamla versioner av samma kalender
+      const oldBlobs = blobs.filter((blob) =>
+        blob.pathname.includes(document.uniqueId)
+      );
+
+      // Spara ny version
       const result = await put(blobName, jsonContent, {
         contentType: "application/json",
         access: "public",
       });
-      const { blobs } = await list({ prefix: this.prefix });
-      const savedBlob = blobs.find(
-        (blob) =>
-          blob.pathname.endsWith(blobName) ||
-          blob.pathname.includes(`/${blobName}`)
-      );
-      if (savedBlob) {
-      } else {
-        console.warn(
-          `Varning: Kunde inte verifiera att bloben sparades. Hittade ${blobs.length} blobs men ingen matchade ${blobName}`
-        );
+
+      // Ta bort gamla versioner
+      for (const oldBlob of oldBlobs) {
+        try {
+          await del(oldBlob.url);
+        } catch (error) {
+          console.error(`Failed to delete old blob: ${oldBlob.url}`, error);
+        }
       }
-      return updatedDocument;
+
+      return result;
     } catch (error) {
-      console.error(`Fel vid sparande av data: ${error.message}`);
-      console.error(`Stack: ${error.stack}`);
+      console.error("Error in save:", error);
       throw error;
     }
   }

@@ -205,8 +205,11 @@ export async function getCalendarById(uniqueId) {
     console.log(`Hämtar kalender med ID: ${uniqueId}`);
     const { blobs } = await list();
 
-    // Leta efter .ics-filen direkt
-    const icsBlob = blobs.find((blob) => blob.pathname === `${uniqueId}.ics`);
+    // Leta efter .ics-filen som innehåller uniqueId
+    const icsBlob = blobs.find(
+      (blob) =>
+        blob.pathname.includes(uniqueId) && blob.pathname.endsWith(".ics")
+    );
 
     if (!icsBlob) {
       console.log(`Hittade ingen .ics-fil för ID: ${uniqueId}`);
