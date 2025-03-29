@@ -1,7 +1,10 @@
 import axios from "axios";
 import ICAL from "ical.js";
-import ICalUrl from "../models/ICalUrl.js";
 import crypto from "crypto";
+import { put, list } from "@vercel/blob";
+
+// Hjälpfunktion för att vänta mellan retry-försök
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function fetchICalData(url) {
   try {
@@ -9,65 +12,64 @@ export async function fetchICalData(url) {
     if (url.startsWith("webcals://")) {
       modifiedUrl = url.replace("webcals://", "https://");
     }
+
     const response = await axios.get(modifiedUrl, {
-      timeout: 10000,
+      timeout: 120000,
       headers: {
         "User-Agent": "Calendar-Converter",
+        Accept: "text/calendar",
+        "Cache-Control": "no-cache",
       },
     });
+
     return response.data;
   } catch (error) {
     console.error("Fel vid hämtning av iCal-data:", error.message);
-    if (error.response) {
-      console.error(`Statuskod: ${error.response.status}`);
-      console.error(`Svarsdata: ${JSON.stringify(error.response.data)}`);
-    }
-    throw new Error(`Kunde inte hämta iCal-data: ${error.message}`);
+    throw error;
   }
 }
 
 export function processICalData(data, summary = "Jobb") {
   try {
     if (!data || typeof data !== "string") {
-      console.error("Ogiltig iCal-data:", typeof data);
       throw new Error("Ogiltig iCal-data: data måste vara en sträng");
     }
+
     const jcalData = ICAL.parse(data);
     const comp = new ICAL.Component(jcalData);
     const events = comp.getAllSubcomponents("vevent");
+    console.log(`Bearbetar ${events.length} kalenderhändelser`);
+
     const dailyEvents = {};
     events.forEach((event) => {
-      try {
-        const dtstart = event.getFirstPropertyValue("dtstart");
-        const dtend = event.getFirstPropertyValue("dtend");
-        if (!dtstart || !dtend) {
-          return;
+      const dtstart = event.getFirstPropertyValue("dtstart");
+      const dtend = event.getFirstPropertyValue("dtend");
+      if (!dtstart || !dtend) return;
+
+      const startDate = dtstart.toJSDate();
+      const endDate = dtend.toJSDate();
+      const date = startDate.toISOString().substr(0, 10);
+
+      if (!dailyEvents[date]) {
+        dailyEvents[date] = {
+          start: startDate.toISOString(),
+          end: endDate.toISOString(),
+          summary: summary,
+        };
+      } else {
+        if (endDate > new Date(dailyEvents[date].end)) {
+          dailyEvents[date].end = endDate.toISOString();
         }
-        const startDate = dtstart.toJSDate();
-        const endDate = dtend.toJSDate();
-        const date = startDate.toISOString().substr(0, 10);
-        if (!dailyEvents[date]) {
-          dailyEvents[date] = {
-            start: startDate.toISOString(),
-            end: endDate.toISOString(),
-            summary: summary,
-          };
-        } else {
-          if (endDate > new Date(dailyEvents[date].end)) {
-            dailyEvents[date].end = endDate.toISOString();
-          }
-          if (startDate < new Date(dailyEvents[date].start)) {
-            dailyEvents[date].start = startDate.toISOString();
-          }
+        if (startDate < new Date(dailyEvents[date].start)) {
+          dailyEvents[date].start = startDate.toISOString();
         }
-      } catch (eventError) {
-        console.error("Fel vid bearbetning av enskild händelse:", eventError);
       }
     });
+
     return dailyEvents;
   } catch (error) {
     console.error("Fel vid bearbetning av iCal-data:", error);
-    throw new Error(`Kunde inte bearbeta iCal-data: ${error.message}`);
+    throw error;
   }
 }
 
@@ -75,22 +77,16 @@ export function createICalFile(dailyEvents, summary = "Jobb") {
   const component = new ICAL.Component(["vcalendar", [], []]);
   component.addPropertyWithValue("version", "2.0");
   component.addPropertyWithValue("prodid", "-//iCal Converter//Calendar//SV");
-  Object.keys(dailyEvents).forEach((date) => {
-    const { start, end } = dailyEvents[date];
-    if (!start || !end) {
-      console.error("Start eller slut är undefined:", start, end);
-      return;
-    }
+
+  Object.entries(dailyEvents).forEach(([date, { start, end }]) => {
     const startDate = new Date(start);
     const endDate = new Date(end);
-    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-      console.error("Ogiltigt datum:", start, end);
-      return;
-    }
+
     const vevent = new ICAL.Component("vevent");
     const uid = `${date}-${crypto.randomBytes(8).toString("hex")}`;
     vevent.addPropertyWithValue("uid", uid);
     vevent.addPropertyWithValue("summary", summary);
+
     const startTime = new ICAL.Time({
       year: startDate.getFullYear(),
       month: startDate.getMonth() + 1,
@@ -100,6 +96,7 @@ export function createICalFile(dailyEvents, summary = "Jobb") {
       second: 0,
       isDate: false,
     });
+
     const endTime = new ICAL.Time({
       year: endDate.getFullYear(),
       month: endDate.getMonth() + 1,
@@ -109,116 +106,123 @@ export function createICalFile(dailyEvents, summary = "Jobb") {
       second: 0,
       isDate: false,
     });
+
     vevent.addPropertyWithValue("dtstart", startTime);
     vevent.addPropertyWithValue("dtend", endTime);
     component.addSubcomponent(vevent);
   });
+
   return component.toString();
-}
-
-export function generateUniqueId(url) {
-  return crypto.createHash("md5").update(url).digest("hex");
-}
-
-export async function saveOrUpdateICalUrl(url, summary = "Jobb") {
-  try {
-    const uniqueId = generateUniqueId(url);
-    const data = await fetchICalData(url);
-    const processedData = processICalData(data, summary);
-    const icalContent = createICalFile(processedData, summary);
-    const existingUrl = await ICalUrl.findOne({ uniqueId });
-    if (existingUrl) {
-      existingUrl.processedData = processedData;
-      existingUrl.icalContent = icalContent;
-      existingUrl.lastUpdated = new Date().toISOString();
-      existingUrl.summary = summary;
-      const updatedUrl = await ICalUrl.save(existingUrl);
-      return updatedUrl;
-    } else {
-      const newUrl = {
-        originalUrl: url,
-        processedData,
-        icalContent,
-        uniqueId,
-        summary,
-        lastUpdated: new Date().toISOString(),
-      };
-      const savedUrl = await ICalUrl.save(newUrl);
-      return savedUrl;
-    }
-  } catch (error) {
-    console.error("Fel vid sparande av iCal URL:", error);
-    throw new Error(`Kunde inte spara iCal URL: ${error.message}`);
-  }
-}
-
-export async function getICalUrl(uniqueId) {
-  try {
-    if (!uniqueId) {
-      console.error("getICalUrl: Inget uniqueId angavs");
-      return null;
-    }
-    const icalUrl = await ICalUrl.findOne({ uniqueId });
-    return icalUrl;
-  } catch (error) {
-    console.error(`Fel vid hämtning av iCal URL: ${error.message}`);
-    console.error(`Stack: ${error.stack}`);
-    throw new Error(`Kunde inte hämta iCal URL: ${error.message}`);
-  }
 }
 
 export async function updateAllICalUrls() {
   try {
-    // Importera updateStatus från index.js om det finns tillgängligt
-    let updateStatus;
-    try {
-      const { updateStatus: importedStatus } = await import("../api/index.js");
-      updateStatus = importedStatus;
-    } catch (importError) {
-      console.log(
-        "Kunde inte importera updateStatus, fortsätter utan statusuppdatering"
-      );
-    }
+    console.log("Hämtar alla kalendrar från Vercel Blob...");
+    const { blobs } = await list();
+    const calendarBlobs = blobs.filter((blob) =>
+      blob.pathname.endsWith(".json")
+    );
+    console.log(`Hittade ${calendarBlobs.length} kalendrar att uppdatera`);
 
-    const urls = await ICalUrl.find();
-    console.log(`Uppdaterar ${urls.length} kalendrar...`);
-
-    // Uppdatera en kalender i taget för att undvika att överbelasta systemet
-    for (const url of urls) {
+    const results = [];
+    for (const blob of calendarBlobs) {
       try {
-        console.log(
-          `Uppdaterar kalender: ${url.uniqueId} (${url.originalUrl})`
+        console.log(`Hämtar data för kalender: ${blob.pathname}`);
+        const response = await axios.get(blob.url);
+        const calendarData = response.data;
+
+        if (!calendarData || !calendarData.originalUrl) {
+          console.error(`Ogiltig kalenderdata för ${blob.pathname}`);
+          results.push({
+            pathname: blob.pathname,
+            success: false,
+            error: "Ogiltig kalenderdata",
+          });
+          continue;
+        }
+
+        // Hämta och bearbeta ny kalenderdata
+        const data = await fetchICalData(calendarData.originalUrl);
+        const processedData = processICalData(
+          data,
+          calendarData.summary || "Jobb"
         );
-        const data = await fetchICalData(url.originalUrl);
-        const processedData = processICalData(data, url.summary || "Jobb");
         const icalContent = createICalFile(
           processedData,
-          url.summary || "Jobb"
+          calendarData.summary || "Jobb"
         );
-        url.processedData = processedData;
-        url.icalContent = icalContent;
-        url.lastUpdated = new Date().toISOString();
-        await ICalUrl.save(url);
-        console.log(`Uppdatering slutförd för kalender: ${url.uniqueId}`);
+
+        // Spara den uppdaterade kalenderfilen
+        const icsBlob = await put(calendarData.uniqueId + ".ics", icalContent, {
+          access: "public",
+        });
+
+        // Uppdatera metadata
+        const updatedData = {
+          ...calendarData,
+          processedData,
+          icalContent,
+          blobUrl: icsBlob.url,
+          lastUpdated: new Date().toISOString(),
+        };
+
+        // Spara uppdaterad metadata
+        await put(blob.pathname, JSON.stringify(updatedData, null, 2), {
+          access: "public",
+        });
+
+        results.push({
+          pathname: blob.pathname,
+          success: true,
+        });
       } catch (error) {
-        console.error(`Fel vid uppdatering av ${url.originalUrl}:`, error);
+        console.error(`Fel vid uppdatering av ${blob.pathname}:`, error);
+        results.push({
+          pathname: blob.pathname,
+          success: false,
+          error: error.message,
+        });
       }
-
-      // Lägg till en kort paus mellan varje kalenderuppdatering för att undvika att överbelasta systemet
-      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
-    // Uppdatera status om det är tillgängligt
-    if (updateStatus) {
-      updateStatus.isUpdating = false;
-      updateStatus.lastUpdateCompleted = new Date().toISOString();
-      updateStatus.error = null;
-    }
-
-    console.log("Alla kalendrar har uppdaterats");
-    return { success: true, count: urls.length };
+    return {
+      success: true,
+      message: "Uppdatering slutförd",
+      results,
+    };
   } catch (error) {
-    console.error("Fel vid uppdatering av alla iCal URLs:", error);
-    throw new Error(`Kunde inte uppdatera alla iCal URLs: ${error.message}`);
+    console.error("Fel vid uppdatering av kalendrar:", error);
+    throw {
+      success: false,
+      message: "Fel vid uppdatering av kalendrar",
+      error: error.message,
+    };
+  }
+}
+
+export async function getCalendarById(uniqueId) {
+  try {
+    console.log(`Hämtar kalender med ID: ${uniqueId}`);
+    const { blobs } = await list();
+
+    // Leta efter .ics-filen direkt
+    const icsBlob = blobs.find((blob) => blob.pathname === `${uniqueId}.ics`);
+
+    if (!icsBlob) {
+      console.log(`Hittade ingen .ics-fil för ID: ${uniqueId}`);
+      return null;
+    }
+
+    // Hämta .ics-innehållet
+    const icsResponse = await axios.get(icsBlob.url);
+    const icalContent = icsResponse.data;
+
+    return {
+      icalContent,
+      blobUrl: icsBlob.url,
+    };
+  } catch (error) {
+    console.error(`Fel vid hämtning av kalender ${uniqueId}:`, error);
+    throw error;
   }
 }
