@@ -1,13 +1,32 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { updateAllICalUrls, getCalendarById } from "../services/icalService.js";
+import mongoose from "mongoose";
+import ICalUrl from "../models/ICalUrl.js";
+import {
+  fetchICalData,
+  processICalData,
+  createICalFile,
+  updateAllICalUrls,
+  getCalendarById,
+} from "../services/icalService.js";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const UPDATE_INTERVAL = parseInt(process.env.UPDATE_INTERVAL) || 3600000;
+
+async function connectToMongoDB() {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log("MongoDB ansluten");
+  } catch (err) {
+    console.error("Fel vid anslutning till MongoDB:", err);
+    process.exit(1);
+  }
+}
+connectToMongoDB();
 
 app.use(
   cors({
@@ -32,24 +51,68 @@ app.get("/", (req, res) => {
   });
 });
 
+export const generateStatus = {
+  isGenerating: false,
+  lastGenerateStarted: null,
+  lastGenerateCompleted: null,
+  error: null,
+  uniqueId: null,
+};
+
 app.post("/generate", async (req, res) => {
   const { url, summary } = req.body;
   if (!url) {
     return res.status(400).json({ error: "URL saknas" });
   }
   try {
-    // Temporärt inaktiverad
-    return res.status(503).json({
-      error: "Tjänsten är temporärt inaktiverad",
-      message: "Generering av nya kalendrar är för närvarande inte tillgänglig",
+    const effectiveSummary = summary || "Jobb";
+    const icalData = await fetchICalData(url);
+    const dailyEvents = processICalData(icalData, effectiveSummary);
+    const icalContent = createICalFile(dailyEvents, effectiveSummary);
+
+    const crypto = await import("crypto");
+    const uniqueId = crypto
+      .createHash("sha256")
+      .update(url + effectiveSummary)
+      .digest("hex")
+      .slice(0, 16);
+
+    const saved = await ICalUrl.save({
+      uniqueId,
+      url,
+      summary: effectiveSummary,
+      icalContent,
+      lastUpdated: new Date(),
+    });
+
+    if (!saved) {
+      return res.status(500).json({
+        error: "Kunde inte spara kalendern",
+        message: "Ingen data returnerades från tjänsten",
+      });
+    }
+
+    const apiUrl = `${req.protocol}://${req.get("host")}/calendar/${uniqueId}`;
+    const googleCalendarLink = `https://www.google.com/calendar/render?cid=${encodeURIComponent(
+      apiUrl
+    )}`;
+    res.json({
+      googleLink: googleCalendarLink,
+      apiUrl: apiUrl,
+      lastUpdated: saved.lastUpdated,
     });
   } catch (error) {
-    console.error("Fel vid generering:", error);
+    console.error("Fel vid generering av iCal:", error);
     res.status(500).json({
-      error: "Ett fel uppstod vid generering av kalendern",
+      error: "Ett fel inträffade vid generering av kalendern",
       message: error.message,
+      stack: process.env.NODE_ENV === "production" ? undefined : error.stack,
     });
   }
+});
+
+app.get("/generate-status", (req, res) => {
+  res.json(generateStatus);
 });
 
 app.get("/calendar/:id", async (req, res) => {
@@ -73,7 +136,6 @@ app.get("/calendar/:id", async (req, res) => {
   }
 });
 
-// Lägg till en global variabel för att hålla koll på uppdateringsstatus
 export const updateStatus = {
   isUpdating: false,
   lastUpdateStarted: null,
@@ -92,44 +154,45 @@ app.get("/update-calendars", async (req, res) => {
       });
     }
 
-    console.log("Startar uppdatering av kalendrar...");
-    const results = await updateAllICalUrls();
+    if (updateStatus.isUpdating) {
+      return res.status(202).json({
+        message: "Uppdatering pågår redan",
+        updateStatus,
+      });
+    }
+
+    updateStatus.isUpdating = true;
+    updateStatus.lastUpdateStarted = new Date().toISOString();
+    updateStatus.error = null;
+
+    (async () => {
+      try {
+        await updateAllICalUrls();
+        updateStatus.isUpdating = false;
+        updateStatus.lastUpdateCompleted = new Date().toISOString();
+      } catch (err) {
+        updateStatus.isUpdating = false;
+        updateStatus.lastUpdateCompleted = new Date().toISOString();
+        updateStatus.error = err.message || String(err);
+      }
+    })();
+
     res.json({
-      status: "success",
-      message: "Uppdatering slutförd",
-      results,
+      message: "Uppdatering startad",
+      updateStatus,
     });
   } catch (error) {
-    console.error("Fel vid uppdatering:", error);
+    updateStatus.isUpdating = false;
+    updateStatus.error = error.message || String(error);
     res.status(500).json({
-      status: "error",
-      message: "Fel vid uppdatering av kalendrar",
-      error: error.message,
+      error: "Ett fel uppstod vid start av uppdatering",
+      message: error.message,
     });
   }
 });
 
-app.get("/update-status", async (req, res) => {
-  try {
-    const apiKey = req.query.apiKey;
-    const configuredApiKey = process.env.UPDATE_API_KEY;
-
-    if (configuredApiKey && apiKey !== configuredApiKey) {
-      return res.status(401).json({ error: "Ogiltig API-nyckel" });
-    }
-
-    res.json({
-      ...updateStatus,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error("Fel vid hämtning av uppdateringsstatus:", error);
-    res.status(500).json({
-      error: "Ett fel inträffade vid hämtning av uppdateringsstatus",
-      message: error.message,
-      stack: process.env.NODE_ENV === "production" ? undefined : error.stack,
-    });
-  }
+app.get("/update-status", (req, res) => {
+  res.json(updateStatus);
 });
 
 if (process.env.NODE_ENV !== "production") {
