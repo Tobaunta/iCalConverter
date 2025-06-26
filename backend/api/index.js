@@ -3,13 +3,18 @@ import cors from "cors";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 import ICalUrl from "../models/ICalUrl.js";
-import {
-  fetchICalData,
-  processICalData,
+import * as icalService from "../services/icalService.js";
+
+// Hjälpfunktioner
+const { 
+  fetchICalData, 
+  processICalData, 
   createICalFile,
-  updateAllICalUrls,
-  getCalendarById,
-} from "../services/icalService.js";
+  getCalendarById 
+} = icalService;
+
+// Skapa en instans av vår modell
+const Calendar = ICalUrl;
 
 dotenv.config();
 
@@ -18,12 +23,27 @@ const PORT = process.env.PORT || 3000;
 const UPDATE_INTERVAL = parseInt(process.env.UPDATE_INTERVAL) || 3600000;
 
 async function connectToMongoDB() {
+  // Om vi redan är anslutna, returnera direkt
+  if (mongoose.connection.readyState === 1) {
+    console.log("Redan ansluten till MongoDB");
+    return true;
+  }
+
   try {
-    await mongoose.connect(process.env.MONGODB_URI);
+    console.log("Försöker ansluta till MongoDB...");
+    await mongoose.connect(process.env.MONGODB_URI, {
+      serverSelectionTimeoutMS: 30000, // 30 sekunder timeout
+      socketTimeoutMS: 45000, // 45 sekunder
+      maxPoolSize: 10, // Max antal anslutningar i poolen
+    });
+    
     console.log("MongoDB ansluten");
+    return true;
+    
   } catch (err) {
     console.error("Fel vid anslutning till MongoDB:", err);
-    process.exit(1);
+    console.error("Kontrollera att MONGODB_URI är korrekt och att MongoDB är igång");
+    return false;
   }
 }
 connectToMongoDB();
@@ -161,26 +181,144 @@ app.get("/update-calendars", async (req, res) => {
       });
     }
 
+    // Sätt statusen till uppdaterar
     updateStatus.isUpdating = true;
     updateStatus.lastUpdateStarted = new Date().toISOString();
     updateStatus.error = null;
 
-    (async () => {
-      try {
-        await updateAllICalUrls();
-        updateStatus.isUpdating = false;
-        updateStatus.lastUpdateCompleted = new Date().toISOString();
-      } catch (err) {
-        updateStatus.isUpdating = false;
-        updateStatus.lastUpdateCompleted = new Date().toISOString();
-        updateStatus.error = err.message || String(err);
-      }
-    })();
-
+    // Spara en kopia av statusen för att skicka tillbaka
+    const responseStatus = { ...updateStatus };
+    
+    // Skicka tillbaka svar direkt
     res.json({
       message: "Uppdatering startad",
-      updateStatus,
+      updateStatus: responseStatus,
     });
+    
+    // Kör uppdateringen i bakgrunden
+    (async () => {
+      let conn;
+      try {
+        console.log("Startar asynkron uppdatering...");
+        // Skapa en ny anslutning specifikt för denna uppdatering
+        // Hämta anslutningssträngen från miljövariabeln
+        const connectionString = process.env.MONGODB_URI;
+        
+        // Logga en del av anslutningssträngen för felsökning (utan känslig info)
+        const logSafeString = connectionString
+          .replace(/\/\/([^:]+):([^@]+)@/, '//$1:*****@')
+          .replace(/\?.*$/, '?*****');
+        
+        console.log("Försöker ansluta till MongoDB...");
+        console.log("Anslutningssträng:", logSafeString);
+        
+        // Skapa en enklare anslutning med färre inställningar
+        // MongoDB Atlas hanterar de flesta inställningarna automatiskt via SRV-URI:n
+        const connectionOptions = {
+          serverSelectionTimeoutMS: 10000,  // 10 sekunder
+          socketTimeoutMS: 45000,           // 45 sekunder
+          connectTimeoutMS: 10000,          // 10 sekunder
+          maxPoolSize: 1,                   // Använd bara en anslutning
+          retryWrites: true,
+          w: 'majority',
+          appName: 'iCalConverter-Update'
+        };
+        
+        console.log("Skapar anslutning till MongoDB...");
+        
+        // Skapa en ny anslutning med async/await
+        try {
+          conn = await new Promise((resolve, reject) => {
+            const newConn = mongoose.createConnection(connectionString, connectionOptions);
+            
+            newConn.on('connected', () => {
+              console.log('MongoDB ansluten');
+              resolve(newConn);
+            });
+            
+            newConn.on('error', (err) => {
+              console.error('MongoDB anslutningsfel:', err);
+              reject(err);
+            });
+          });
+          
+          // Testa anslutningen
+          console.log("Testar anslutningen med ping...");
+          await conn.db.admin().ping();
+          console.log("MongoDB svarar på ping");
+          
+        } catch (error) {
+          console.error("Kunde inte ansluta till MongoDB:", error);
+          throw error; // Kasta vidare felet för att fångas av den yttre try-catchen
+        }
+        
+        // Ladda modellen med den nya anslutningen
+        const CalendarModel = conn.model('ICalUrl', ICalUrl.schema);
+        
+        console.log("Hämtar kalendrar från databasen...");
+        const calendars = await CalendarModel.find({}).maxTimeMS(5000).lean();
+        console.log(`Hittade ${calendars.length} kalendrar att uppdatera`);
+        
+        for (const calendarData of calendars) {
+          try {
+            console.log(`\n=== Behandlar kalender: ${calendarData.uniqueId} ===`);
+            const calendarUrl = calendarData?.url || calendarData?.originalUrl || calendarData?.icalUrl;
+
+            if (!calendarData || !calendarUrl) {
+              console.error(`Saknar URL för kalender: ${calendarData.uniqueId}`);
+              continue;
+            }
+
+            console.log(`Hämtar iCal-data från: ${calendarUrl.substring(0, 50)}...`);
+            const icalData = await fetchICalData(calendarUrl);
+            console.log("iCal-data hämtad, bearbetar händelser...");
+            
+            const dailyEvents = processICalData(icalData, calendarData.summary);
+            console.log(`Bearbetade ${dailyEvents.length} händelser`);
+            
+            console.log("Uppdaterar kalendern i databasen...");
+            
+            // Ta bort befintligt dokument med samma uniqueId
+            await CalendarModel.deleteMany({ uniqueId: calendarData.uniqueId });
+            
+            // Skapa och spara nytt dokument
+            const newCalendar = new CalendarModel({
+              uniqueId: calendarData.uniqueId,
+              url: calendarUrl,
+              summary: calendarData.summary,
+              icalContent: createICalFile(dailyEvents, calendarData.summary),
+              lastUpdated: new Date()
+            });
+            
+            await newCalendar.save();
+            console.log("Kalender uppdaterad");
+          } catch (error) {
+            console.error(`Fel vid uppdatering av kalender ${calendarData.uniqueId}:`, error);
+            // Fortsätt med nästa kalender vid fel
+          }
+        }
+        
+        // Uppdatera status vid lyckad uppdatering
+        updateStatus.isUpdating = false;
+        updateStatus.lastUpdateCompleted = new Date().toISOString();
+        updateStatus.error = null;
+        
+      } catch (err) {
+        console.error("Fel i uppdateringsprocessen:", err);
+        updateStatus.isUpdating = false;
+        updateStatus.error = err.message;
+        updateStatus.lastUpdateCompleted = new Date().toISOString();
+      } finally {
+        // Stäng anslutningen om den skapades
+        if (conn) {
+          try {
+            await conn.close();
+          } catch (closeErr) {
+            console.error("Fel vid stängning av anslutning:", closeErr);
+          }
+        }
+      }
+    })();
   } catch (error) {
     updateStatus.isUpdating = false;
     updateStatus.error = error.message || String(error);

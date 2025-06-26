@@ -11,48 +11,12 @@ const ICalUrlSchema = new mongoose.Schema(
   { collection: "icalurls" }
 );
 
-const ICalUrlMongo =
-  mongoose.models.ICalUrlMongo || mongoose.model("ICalUrlMongo", ICalUrlSchema);
-
-class ICalUrlModel {
-  constructor() {}
-
-  async findOne({ uniqueId }) {
-    try {
-      const doc = await ICalUrlMongo.findOne({ uniqueId }).lean();
-      return doc || null;
-    } catch (error) {
-      console.error(`Fel vid hämtning av data: ${error.message}`);
-      return null;
-    }
-  }
-
-  async save(document) {
-    try {
-      await ICalUrlMongo.deleteMany({ uniqueId: document.uniqueId });
-      const doc = new ICalUrlMongo({
-        ...document,
-        lastUpdated: new Date(),
-      });
-      await doc.save();
-      return doc.toObject();
-    } catch (error) {
-      console.error("Error in save:", error);
-      throw error;
-    }
-  }
-
-  async find() {
-    try {
-      const docs = await ICalUrlMongo.find({}).lean();
-      return docs;
-    } catch (error) {
-      console.error("Fel vid hämtning av alla kalendrar:", error);
-      throw error;
-    }
-  }
+// Skapa modellen direkt utan att kasta fel om den redan finns
+let ICalUrlModel;
+try {
+  ICalUrlModel = mongoose.models.ICalUrl || mongoose.model("ICalUrl", ICalUrlSchema);
+} catch (e) {
+  ICalUrlModel = mongoose.model("ICalUrl");
 }
 
-const ICalUrl = new ICalUrlModel();
-
-export default ICalUrl;
+export default ICalUrlModel;

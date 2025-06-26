@@ -1,6 +1,7 @@
 import axios from "axios";
 import ICAL from "ical.js";
 import crypto from "crypto";
+import mongoose from "mongoose";
 import ICalUrl from "../models/ICalUrl.js";
 
 // Hjälpfunktion för att vänta mellan retry-försök
@@ -133,21 +134,44 @@ export function createICalFile(dailyEvents, summary = "Jobb") {
   return component.toString();
 }
 
-export async function updateAllICalUrls() {
-  console.log("Startar uppdatering av alla iCal-URLs");
+export async function updateAllICalUrls(mongooseConnection) {
+  console.log("=== Startar uppdatering av alla iCal-URLs ===");
+  
+  // Använd den skickade anslutningen eller standard mongoose
+  const mongooseToUse = mongooseConnection || mongoose;
+  
+  console.log("MongoDB-anslutningsstatus:", mongooseToUse.connection.readyState === 1 ? 'Ansluten' : 'Ej ansluten');
+  
+  // Kontrollera om vi har en aktiv anslutning
+  if (mongooseToUse.connection.readyState !== 1) {
+    console.error("Ingen aktiv MongoDB-anslutning!");
+    throw new Error("Ingen aktiv anslutning till databasen");
+  }
+  
   const results = [];
 
   try {
+    console.log("Hämtar alla kalendrar från databasen...");
     const calendars = await ICalUrl.find();
+    console.log(`Hittade ${calendars.length} kalendrar att uppdatera`);
+    
+    // Logga de hittade kalendrarna för felsökning
+    calendars.forEach(cal => {
+      console.log(`- Kalender: ${cal.uniqueId}, Uppdaterad: ${cal.lastUpdated}`);
+    });
+    
+    if (calendars.length === 0) {
+      console.log("Inga kalendrar hittades i databasen");
+      return [];
+    }
+    
     for (const calendarData of calendars) {
       try {
-        console.log(`Behandlar kalender: ${calendarData.uniqueId}`);
-        const calendarUrl =
-          calendarData?.url ||
-          calendarData?.originalUrl ||
-          calendarData?.icalUrl;
+        console.log(`\n=== Behandlar kalender: ${calendarData.uniqueId} ===`);
+        const calendarUrl = calendarData?.url || calendarData?.originalUrl || calendarData?.icalUrl;
 
         if (!calendarData || !calendarUrl) {
+          console.error(`Saknar URL för kalender: ${calendarData.uniqueId}`);
           results.push({
             uniqueId: calendarData.uniqueId,
             success: false,
@@ -156,21 +180,38 @@ export async function updateAllICalUrls() {
           continue;
         }
 
+        console.log(`Hämtar iCal-data från: ${calendarUrl.substring(0, 50)}...`);
         const icalData = await fetchICalData(calendarUrl);
+        console.log("iCal-data hämtad, bearbetar händelser...");
+        
         const dailyEvents = processICalData(icalData, calendarData.summary);
+        console.log(`Bearbetade ${dailyEvents.length} händelser`);
+        
+        console.log("Skapar iCal-fil...");
         const icalContent = createICalFile(dailyEvents, calendarData.summary);
+        console.log("iCal-fil skapad, sparar till databasen...");
 
-        await ICalUrl.save({
+        // Använd modellens save-metod
+        const saveData = {
           uniqueId: calendarData.uniqueId,
           url: calendarUrl,
           summary: calendarData.summary,
-          icalContent,
-          lastUpdated: new Date(),
-        });
+          icalContent: icalContent
+        };
+        
+        console.log("Sparar till databasen...");
+        const savedDoc = await ICalUrl.save(saveData);
+        
+        if (savedDoc) {
+          console.log(`Sparat dokument med ID: ${savedDoc._id}`);
+          console.log(`Uppdaterad tidsstämpel: ${savedDoc.lastUpdated}`);
+        } else {
+          console.error("Kunde inte spara dokumentet");
+        }
 
         results.push({
           uniqueId: calendarData.uniqueId,
-          success: true,
+          success: !!savedDoc,
         });
       } catch (error) {
         results.push({
