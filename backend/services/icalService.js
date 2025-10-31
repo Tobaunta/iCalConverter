@@ -1,247 +1,232 @@
-import axios from "axios";
-import ICAL from "ical.js";
-import crypto from "crypto";
-import mongoose from "mongoose";
-import ICalUrl from "../models/ICalUrl.js";
+import axios from 'axios';
+import ICAL from 'ical.js';
+import { DateTime } from 'luxon';
+import crypto from 'crypto';
 
-// Hjälpfunktion för att vänta mellan retry-försök
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
+/**
+ * Hämtar iCal-data från en URL
+ */
 export async function fetchICalData(url) {
   try {
-    if (!url) {
-      throw new Error("Ingen URL angiven för kalendern");
-    }
-
-    let modifiedUrl = url;
-    if (url.startsWith("webcals://")) {
-      modifiedUrl = url.replace("webcals://", "https://");
-    }
-
-    const response = await axios.get(modifiedUrl, {
-      timeout: 120000,
+    // Konvertera webcals:// till https://
+    const httpsUrl = url.replace(/^webcals:\/\//, 'https://');
+    
+    const response = await axios.get(httpsUrl, {
       headers: {
-        "User-Agent": "Calendar-Converter",
-        Accept: "text/calendar",
-        "Cache-Control": "no-cache",
+        'User-Agent': 'Calendar-Converter'
       },
+      timeout: 120000 // 120 sekunder timeout
     });
-
+    
     return response.data;
   } catch (error) {
-    console.error("Fel vid hämtning av iCal-data:", error.message);
-    if (!url) {
-      throw new Error("Ingen URL angiven för kalendern");
-    }
-    throw error;
+    throw new Error(`Kunde inte hämta iCal-data: ${error.message}`);
   }
 }
 
-export function processICalData(data, summary = "Jobb") {
-  try {
-    if (!data || typeof data !== "string") {
-      throw new Error("Ogiltig iCal-data: data måste vara en sträng");
-    }
+/**
+ * Beräknar unikt ID baserat på URL och summary
+ */
+export function generateUniqueId(url, summary = 'Jobb') {
+  const hash = crypto.createHash('sha256');
+  hash.update(url + summary);
+  return hash.digest('hex').slice(0, 16);
+}
 
-    const jcalData = ICAL.parse(data);
+/**
+ * Bestämmer vilket arbetsdygn en tidsstämpel tillhör
+ * Arbetsdygn: 06:00 - 06:00 nästa dag
+ */
+function getWorkdayAnchor(dateTime, timezone) {
+  const dt = dateTime.setZone(timezone);
+  
+  if (dt.hour >= 6) {
+    // Om klockan är 06:00 eller senare, tillhör samma dag
+    return dt.startOf('day');
+  } else {
+    // Om klockan är före 06:00, tillhör föregående dag
+    return dt.minus({ days: 1 }).startOf('day');
+  }
+}
+
+/**
+ * Delar upp ett event i segment baserat på arbetsdygn (06:00-06:00)
+ */
+function splitEventByWorkdays(startTime, endTime, timezone) {
+  const segments = [];
+  let currentStart = startTime.setZone(timezone);
+  const finalEnd = endTime.setZone(timezone);
+  
+  while (currentStart < finalEnd) {
+    const workdayAnchor = getWorkdayAnchor(currentStart, timezone);
+    const workdayEnd = workdayAnchor.plus({ days: 1 }).set({ hour: 6, minute: 0, second: 0 });
+    
+    const segmentEnd = DateTime.min(finalEnd, workdayEnd);
+    
+    segments.push({
+      start: currentStart,
+      end: segmentEnd,
+      workdayDate: workdayAnchor.toISODate()
+    });
+    
+    currentStart = workdayEnd;
+  }
+  
+  return segments;
+}
+
+/**
+ * Filtrerar bort events som innehåller specifika nyckelord
+ */
+function shouldFilterEvent(event) {
+  const summary = event.summary || '';
+  const description = event.description || '';
+  
+  // Lista över nyckelord som ska filtreras bort
+  const filterKeywords = [
+    'work reduction',
+    'holiday',
+    'loa',
+    'care of child',
+    'sick'
+  ];
+  
+  const summaryLower = summary.toLowerCase();
+  const descriptionLower = description.toLowerCase();
+  
+  // Kontrollera om någon av nyckelorden finns i summary eller description
+  return filterKeywords.some(keyword => 
+    summaryLower.includes(keyword) || descriptionLower.includes(keyword)
+  );
+}
+
+/**
+ * Processerar iCal-data enligt arbetsdygnslogik
+ */
+export function processICalData(icalData, summary = 'Jobb', timezone = 'Europe/Stockholm') {
+  try {
+    const jcalData = ICAL.parse(icalData);
     const comp = new ICAL.Component(jcalData);
-    let events = comp.getAllSubcomponents("vevent");
-    // Filtrera bort events som innehåller 'Work reduction' i summary eller description
-    events = events.filter((event) => {
-      const summary = event.getFirstPropertyValue("summary") || "";
-      const description = event.getFirstPropertyValue("description") || "";
-      return !(
-        summary.toLowerCase().includes("work reduction") ||
-        description.toLowerCase().includes("work reduction")
-      );
-    });
-    console.log(
-      `Bearbetar ${events.length} kalenderhändelser efter filtrering`
-    );
-
-    const dailyEvents = {};
-    events.forEach((event) => {
-      const dtstart = event.getFirstPropertyValue("dtstart");
-      const dtend = event.getFirstPropertyValue("dtend");
-      if (!dtstart || !dtend) return;
-
-      const startDate = dtstart.toJSDate();
-      const endDate = dtend.toJSDate();
-      const date = startDate.toISOString().substr(0, 10);
-
-      if (!dailyEvents[date]) {
-        dailyEvents[date] = {
-          start: startDate.toISOString(),
-          end: endDate.toISOString(),
-          summary: summary,
-        };
-      } else {
-        if (endDate > new Date(dailyEvents[date].end)) {
-          dailyEvents[date].end = endDate.toISOString();
-        }
-        if (startDate < new Date(dailyEvents[date].start)) {
-          dailyEvents[date].start = startDate.toISOString();
-        }
+    const vevents = comp.getAllSubcomponents('vevent');
+    
+    // Map för att aggregera events per arbetsdygn
+    const workdayMap = new Map();
+    
+    for (const vevent of vevents) {
+      const event = new ICAL.Event(vevent);
+      
+      // Filtrera bort "Work reduction" events
+      if (shouldFilterEvent(event)) {
+        continue;
       }
-    });
-
-    return dailyEvents;
-  } catch (error) {
-    console.error("Fel vid bearbetning av iCal-data:", error);
-    throw error;
-  }
-}
-
-export function createICalFile(dailyEvents, summary = "Jobb") {
-  const component = new ICAL.Component(["vcalendar", [], []]);
-  component.addPropertyWithValue("version", "2.0");
-  component.addPropertyWithValue("prodid", "-//iCal Converter//Calendar//SV");
-
-  Object.entries(dailyEvents).forEach(([date, { start, end }]) => {
-    const startDate = new Date(start);
-    const endDate = new Date(end);
-
-    const vevent = new ICAL.Component("vevent");
-    const uid = `${date}-${crypto.randomBytes(8).toString("hex")}`;
-    vevent.addPropertyWithValue("uid", uid);
-    vevent.addPropertyWithValue("summary", summary);
-
-    const startTime = new ICAL.Time({
-      year: startDate.getFullYear(),
-      month: startDate.getMonth() + 1,
-      day: startDate.getDate(),
-      hour: startDate.getHours(),
-      minute: startDate.getMinutes(),
-      second: 0,
-      isDate: false,
-    });
-
-    const endTime = new ICAL.Time({
-      year: endDate.getFullYear(),
-      month: endDate.getMonth() + 1,
-      day: endDate.getDate(),
-      hour: endDate.getHours(),
-      minute: endDate.getMinutes(),
-      second: 0,
-      isDate: false,
-    });
-
-    vevent.addPropertyWithValue("dtstart", startTime);
-    vevent.addPropertyWithValue("dtend", endTime);
-    component.addSubcomponent(vevent);
-  });
-
-  return component.toString();
-}
-
-export async function updateAllICalUrls(mongooseConnection) {
-  console.log("=== Startar uppdatering av alla iCal-URLs ===");
-  
-  // Använd den skickade anslutningen eller standard mongoose
-  const mongooseToUse = mongooseConnection || mongoose;
-  
-  console.log("MongoDB-anslutningsstatus:", mongooseToUse.connection.readyState === 1 ? 'Ansluten' : 'Ej ansluten');
-  
-  // Kontrollera om vi har en aktiv anslutning
-  if (mongooseToUse.connection.readyState !== 1) {
-    console.error("Ingen aktiv MongoDB-anslutning!");
-    throw new Error("Ingen aktiv anslutning till databasen");
-  }
-  
-  const results = [];
-
-  try {
-    console.log("Hämtar alla kalendrar från databasen...");
-    const calendars = await ICalUrl.find();
-    console.log(`Hittade ${calendars.length} kalendrar att uppdatera`);
-    
-    // Logga de hittade kalendrarna för felsökning
-    calendars.forEach(cal => {
-      console.log(`- Kalender: ${cal.uniqueId}, Uppdaterad: ${cal.lastUpdated}`);
-    });
-    
-    if (calendars.length === 0) {
-      console.log("Inga kalendrar hittades i databasen");
-      return [];
-    }
-    
-    for (const calendarData of calendars) {
+      
+      // Hämta start- och sluttider
+      let startTime, endTime;
+      
       try {
-        console.log(`\n=== Behandlar kalender: ${calendarData.uniqueId} ===`);
-        const calendarUrl = calendarData?.url || calendarData?.originalUrl || calendarData?.icalUrl;
-
-        if (!calendarData || !calendarUrl) {
-          console.error(`Saknar URL för kalender: ${calendarData.uniqueId}`);
-          results.push({
-            uniqueId: calendarData.uniqueId,
-            success: false,
-            error: "Saknar URL",
-          });
-          continue;
-        }
-
-        console.log(`Hämtar iCal-data från: ${calendarUrl.substring(0, 50)}...`);
-        const icalData = await fetchICalData(calendarUrl);
-        console.log("iCal-data hämtad, bearbetar händelser...");
-        
-        const dailyEvents = processICalData(icalData, calendarData.summary);
-        console.log(`Bearbetade ${dailyEvents.length} händelser`);
-        
-        console.log("Skapar iCal-fil...");
-        const icalContent = createICalFile(dailyEvents, calendarData.summary);
-        console.log("iCal-fil skapad, sparar till databasen...");
-
-        // Använd modellens save-metod
-        const saveData = {
-          uniqueId: calendarData.uniqueId,
-          url: calendarUrl,
-          summary: calendarData.summary,
-          icalContent: icalContent
-        };
-        
-        console.log("Sparar till databasen...");
-        const savedDoc = await ICalUrl.save(saveData);
-        
-        if (savedDoc) {
-          console.log(`Sparat dokument med ID: ${savedDoc._id}`);
-          console.log(`Uppdaterad tidsstämpel: ${savedDoc.lastUpdated}`);
-        } else {
-          console.error("Kunde inte spara dokumentet");
-        }
-
-        results.push({
-          uniqueId: calendarData.uniqueId,
-          success: !!savedDoc,
-        });
+        startTime = DateTime.fromJSDate(event.startDate.toJSDate());
+        endTime = DateTime.fromJSDate(event.endDate.toJSDate());
       } catch (error) {
-        results.push({
-          uniqueId: calendarData.uniqueId,
-          success: false,
-          error: error.message,
-        });
+        console.warn('Kunde inte parsa datum för event:', error.message);
+        continue;
+      }
+      
+      // Dela upp event i arbetsdygn-segment
+      const segments = splitEventByWorkdays(startTime, endTime, timezone);
+      
+      for (const segment of segments) {
+        const workdayDate = segment.workdayDate;
+        
+        if (!workdayMap.has(workdayDate)) {
+          workdayMap.set(workdayDate, {
+            earliestStart: segment.start,
+            latestEnd: segment.end
+          });
+        } else {
+          const existing = workdayMap.get(workdayDate);
+          existing.earliestStart = DateTime.min(existing.earliestStart, segment.start);
+          existing.latestEnd = DateTime.max(existing.latestEnd, segment.end);
+        }
       }
     }
-    return results;
+    
+    // Skapa förenklad iCal
+    return createSimplifiedICal(workdayMap, summary, timezone);
+    
   } catch (error) {
-    console.error("Fel vid uppdatering:", error);
-    throw error;
+    throw new Error(`Kunde inte processa iCal-data: ${error.message}`);
   }
 }
 
-export async function getCalendarById(uniqueId) {
-  try {
-    console.log(`Hämtar kalender med ID: ${uniqueId}`);
-    const calendar = await ICalUrl.findOne({ uniqueId });
-    if (!calendar) {
-      console.log(`Hittade ingen kalender för ID: ${uniqueId}`);
-      return null;
-    }
-    return {
-      icalContent: calendar.icalContent || "",
-      uniqueId: calendar.uniqueId,
-    };
-  } catch (error) {
-    console.error(`Fel vid hämtning av kalender ${uniqueId}:`, error);
-    throw error;
+/**
+ * Skapar en förenklad iCal med ett event per arbetsdygn
+ */
+function createSimplifiedICal(workdayMap, summary, timezone) {
+  const lines = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//iCal Converter//Calendar//SV',
+    'CALSCALE:GREGORIAN'
+  ];
+  
+  // Lägg till tidszon-information
+  if (timezone === 'Europe/Stockholm') {
+    lines.push(
+      'BEGIN:VTIMEZONE',
+      'TZID:Europe/Stockholm',
+      'BEGIN:DAYLIGHT',
+      'TZOFFSETFROM:+0100',
+      'TZOFFSETTO:+0200',
+      'TZNAME:CEST',
+      'DTSTART:19700329T020000',
+      'RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU',
+      'END:DAYLIGHT',
+      'BEGIN:STANDARD',
+      'TZOFFSETFROM:+0200',
+      'TZOFFSETTO:+0100',
+      'TZNAME:CET',
+      'DTSTART:19701025T030000',
+      'RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU',
+      'END:STANDARD',
+      'END:VTIMEZONE'
+    );
   }
+  
+  // Skapa events för varje arbetsdygn
+  for (const [workdayDate, times] of workdayMap) {
+    const randomHex = crypto.randomBytes(4).toString('hex');
+    const uid = `${workdayDate}-${randomHex}`;
+    
+    // Formatera datum för iCal (YYYYMMDDTHHMMSS)
+    const startStr = times.earliestStart.toFormat("yyyyMMdd'T'HHmmss");
+    const endStr = times.latestEnd.toFormat("yyyyMMdd'T'HHmmss");
+    
+    lines.push(
+      'BEGIN:VEVENT',
+      `UID:${uid}`,
+      `DTSTART;TZID=${timezone}:${startStr}`,
+      `DTEND;TZID=${timezone}:${endStr}`,
+      `SUMMARY:${summary}`,
+      `DTSTAMP:${DateTime.now().toUTC().toFormat("yyyyMMdd'T'HHmmss'Z'")}`,
+      'END:VEVENT'
+    );
+  }
+  
+  lines.push('END:VCALENDAR');
+  
+  return lines.join('\r\n');
+}
+
+/**
+ * Huvudfunktion för att processa en iCal-URL
+ */
+export async function processICalUrl(url, summary = 'Jobb', timezone = 'Europe/Stockholm') {
+  const icalData = await fetchICalData(url);
+  const processedICal = processICalData(icalData, summary, timezone);
+  const uniqueId = generateUniqueId(url, summary);
+  
+  return {
+    uniqueId,
+    icalContent: processedICal
+  };
 }

@@ -1,222 +1,321 @@
-import { useState } from "react";
+import { useState, useEffect } from 'react'
 import {
+  Container,
+  Paper,
+  Typography,
   TextField,
   Button,
-  Typography,
-  Container,
   Box,
-  CircularProgress,
   Alert,
-  Link,
   Card,
   CardContent,
-  Paper,
-} from "@mui/material";
-import axios from "axios";
+  Grid,
+  Chip,
+  IconButton,
+  Link,
+  Divider,
+  CircularProgress
+} from '@mui/material'
+import {
+  ContentCopy as CopyIcon,
+  CalendarToday as CalendarIcon,
+  CheckCircle as CheckIcon
+} from '@mui/icons-material'
 
-interface CalendarResponse {
-  googleLink: string;
+interface GenerateResponse {
   apiUrl: string;
+  googleLink: string;
+  uniqueId: string;
   lastUpdated: string;
 }
 
+interface Status {
+  isGenerating?: boolean;
+  isUpdating?: boolean;
+  lastGenerateStarted?: string;
+  lastGenerateCompleted?: string;
+  lastUpdateStarted?: string;
+  lastUpdateCompleted?: string;
+  error?: string;
+  uniqueId?: string;
+}
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+
 function App() {
-  const [icalUrl, setIcalUrl] = useState("");
-  const [eventSummary, setEventSummary] = useState("Jobb");
-  const [calendarData, setCalendarData] = useState<CalendarResponse | null>(
-    null
-  );
+  const [url, setUrl] = useState('');
+  const [summary, setSummary] = useState('Jobb');
+  const [result, setResult] = useState<GenerateResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [generateStatus, setGenerateStatus] = useState<Status>({});
+  const [updateStatus, setUpdateStatus] = useState<Status>({});
+  const [copySuccess, setCopySuccess] = useState(false);
+
+  // Hämta status regelbundet
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try {
+        const [genRes, updateRes] = await Promise.all([
+          fetch(`${API_BASE_URL}/generate-status`),
+          fetch(`${API_BASE_URL}/update-status`)
+        ]);
+        
+        if (genRes.ok) {
+          const genData = await genRes.json();
+          setGenerateStatus(genData);
+        }
+        
+        if (updateRes.ok) {
+          const updateData = await updateRes.json();
+          setUpdateStatus(updateData);
+        }
+      } catch (error) {
+        console.error('Kunde inte hämta status:', error);
+      }
+    };
+
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 5000); // Uppdatera var 5:e sekund
+
+    return () => clearInterval(interval);
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    setResult(null);
 
     try {
-      const response = await axios.post<CalendarResponse>(
-        `${import.meta.env.VITE_API_URL}/generate`,
-        {
-          url: icalUrl,
-          summary: eventSummary,
-        }
-      );
-      setCalendarData(response.data);
+      const response = await fetch(`${API_BASE_URL}/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url, summary }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Något gick fel');
+      }
+
+      const data: GenerateResponse = await response.json();
+      setResult(data);
     } catch (error) {
-      console.error("Fel vid hämtning av ny URL:", error);
-      setError(
-        "Ett fel inträffade vid generering av kalendern. Kontrollera att URL:en är korrekt."
-      );
+      setError(error instanceof Error ? error.message : 'Ett okänt fel inträffade');
     } finally {
       setLoading(false);
     }
   };
 
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
-    return date.toLocaleString("sv-SE", {
-      year: "numeric",
-      month: "numeric",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
+    } catch (error) {
+      console.error('Kunde inte kopiera:', error);
+    }
   };
 
   return (
-    <Container
-      sx={{
-        minHeight: "98vh",
-        display: "flex",
-        flexDirection: "column",
-        justifyContent: "center",
-        alignItems: "center",
-        py: 4,
-      }}
-    >
-      <Typography variant="h4" component="h1" gutterBottom>
-        Kalenderförenklare
-      </Typography>
-
-      <Typography
-        variant="body1"
-        sx={{ mb: 3, textAlign: "center", maxWidth: "600px" }}
-      >
-        Ange en iCal-adress för att skapa en förenklad kalender som visar en
-        händelse per dag från första till sista händelsen.
-      </Typography>
-
-      <Paper
-        elevation={3}
-        sx={{
-          width: "100%",
-          maxWidth: "600px",
-          mb: 4,
-          overflow: "hidden",
-          borderRadius: 2,
-        }}
-      >
-        <Box
-          component="img"
-          src="/printscreen.png"
-          alt="Exempel på kalenderkonvertering"
-          sx={{
-            width: "100%",
-            height: "auto",
-            display: "block",
-          }}
-        />
-        <Box sx={{ p: 2, bgcolor: "background.paper" }}>
-          <Typography variant="subtitle2" color="text.secondary" align="center">
-            Exempel på hur den förenklade kalendern kan se ut
+    <Container maxWidth="md" sx={{ py: 4 }}>
+      <Paper elevation={3} sx={{ p: 4 }}>
+        <Box sx={{ mb: 4 }}>
+          <Typography variant="h3" component="h1" gutterBottom color="primary">
+            iCal Converter
+          </Typography>
+          <Typography variant="body1" color="text.secondary">
+            Konvertera din iCal-kalender till förenklade arbetsdygn (06:00-06:00)
           </Typography>
         </Box>
-      </Paper>
 
-      <Card sx={{ width: "100%", maxWidth: "600px", mb: 4 }}>
-        <CardContent>
-          <form onSubmit={handleSubmit} noValidate>
-            <TextField
-              variant="outlined"
-              margin="normal"
-              required
-              fullWidth
-              label="iCal URL"
-              placeholder="https://example.com/calendar.ics eller webcals://example.com/calendar.ics"
-              value={icalUrl}
-              onChange={(e) => setIcalUrl(e.target.value)}
-              disabled={loading}
-              autoComplete="off"
-            />
-            <TextField
-              variant="outlined"
-              margin="normal"
-              required
-              fullWidth
-              label="Händelsenamn"
-              placeholder="Vad ska händelserna heta i kalendern?"
-              value={eventSummary}
-              onChange={(e) => setEventSummary(e.target.value)}
-              disabled={loading}
-              autoComplete="off"
-            />
-            <Button
-              type="submit"
-              fullWidth
-              variant="contained"
-              color="primary"
-              disabled={loading || !icalUrl || !eventSummary}
-              sx={{ mt: 2 }}
-            >
-              {loading ? (
-                <CircularProgress size={24} />
-              ) : (
-                "Generera förenklad kalender"
-              )}
-            </Button>
-          </form>
-        </CardContent>
-      </Card>
-
-      {error && (
-        <Alert
-          severity="error"
-          sx={{ width: "100%", maxWidth: "600px", mb: 2 }}
-        >
-          {error}
-        </Alert>
-      )}
-
-      {calendarData && (
-        <Card sx={{ width: "100%", maxWidth: "600px" }}>
-          <CardContent>
-            <Typography variant="h6" gutterBottom>
-              Din förenklade kalender är klar!
-            </Typography>
-
-            <Typography variant="body2" color="text.secondary" gutterBottom>
-              Senast uppdaterad: {formatDate(calendarData.lastUpdated)}
-            </Typography>
-
-            <Box sx={{ mt: 2 }}>
-              <Typography variant="subtitle1" gutterBottom>
-                Google Calendar-länk:
-              </Typography>
-              <Link
-                href={calendarData.googleLink}
-                target="_blank"
-                rel="noopener noreferrer"
-                sx={{ wordBreak: "break-all" }}
-              >
-                Klicka här för att lägga till i Google Calendar
-              </Link>
-            </Box>
-
-            <Box sx={{ mt: 3 }}>
-              <Typography variant="subtitle1" gutterBottom>
-                Direkt iCal-länk:
-              </Typography>
+        <Box component="form" onSubmit={handleSubmit} sx={{ mb: 4 }}>
+          <Grid container spacing={3}>
+            <Grid item xs={12}>
               <TextField
-                variant="outlined"
-                size="small"
                 fullWidth
-                value={calendarData.apiUrl}
-                InputProps={{
-                  readOnly: true,
-                }}
-                sx={{ mb: 1 }}
+                label="iCal URL"
+                type="url"
+                value={url}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setUrl(e.target.value)}
+                placeholder="https://example.com/calendar.ics eller webcals://..."
+                required
+                variant="outlined"
               />
-              <Typography variant="body2" color="text.secondary">
-                Använd denna länk för att prenumerera på kalendern i valfri
-                kalenderapp. Kalendern uppdateras automatiskt varje timme.
-              </Typography>
-            </Box>
-          </CardContent>
-        </Card>
-      )}
+            </Grid>
+            
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Sammanfattning (valfritt)"
+                value={summary}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSummary(e.target.value)}
+                placeholder="Jobb"
+                variant="outlined"
+              />
+            </Grid>
+            
+            <Grid item xs={12}>
+              <Button
+                type="submit"
+                variant="contained"
+                size="large"
+                fullWidth
+                disabled={loading || !url}
+                startIcon={loading ? <CircularProgress size={20} /> : <CalendarIcon />}
+              >
+                {loading ? 'Genererar...' : 'Generera kalender'}
+              </Button>
+            </Grid>
+          </Grid>
+        </Box>
+
+        {error && (
+          <Alert severity="error" sx={{ mb: 3 }}>
+            {error}
+          </Alert>
+        )}
+
+        {result && (
+          <Box sx={{ mb: 4 }}>
+            <Typography variant="h5" gutterBottom>
+              Resultat
+            </Typography>
+            
+            <Grid container spacing={2}>
+              <Grid item xs={12}>
+                <Card variant="outlined" sx={{ bgcolor: 'success.light', color: 'success.contrastText' }}>
+                  <CardContent>
+                    <Typography variant="h6" gutterBottom>
+                      API URL
+                    </Typography>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <Box 
+                        component="code" 
+                        sx={{ 
+                          flex: 1, 
+                          p: 1, 
+                          bgcolor: 'background.paper', 
+                          color: 'text.primary',
+                          borderRadius: 1,
+                          fontSize: '0.875rem',
+                          border: 1,
+                          borderColor: 'divider'
+                        }}
+                      >
+                        {result.apiUrl}
+                      </Box>
+                      <IconButton
+                        onClick={() => copyToClipboard(result.apiUrl)}
+                        color={copySuccess ? 'success' : 'primary'}
+                        size="small"
+                      >
+                        {copySuccess ? <CheckIcon /> : <CopyIcon />}
+                      </IconButton>
+                    </Box>
+                  </CardContent>
+                </Card>
+              </Grid>
+
+              <Grid item xs={12}>
+                <Card variant="outlined" sx={{ bgcolor: 'primary.light', color: 'primary.contrastText' }}>
+                  <CardContent>
+                    <Typography variant="h6" gutterBottom>
+                      Google Calendar
+                    </Typography>
+                    <Button
+                      component={Link}
+                      href={result.googleLink}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      variant="contained"
+                      color="primary"
+                      startIcon={<CalendarIcon />}
+                    >
+                      Lägg till i Google Calendar
+                    </Button>
+                  </CardContent>
+                </Card>
+              </Grid>
+            </Grid>
+
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
+              Senast uppdaterad: {new Date(result.lastUpdated).toLocaleString('sv-SE')}
+            </Typography>
+          </Box>
+        )}
+
+        <Divider sx={{ my: 3 }} />
+
+        <Box>
+          <Typography variant="h5" gutterBottom>
+            Status
+          </Typography>
+          
+          <Grid container spacing={2}>
+            <Grid item xs={12} md={6}>
+              <Card variant="outlined">
+                <CardContent>
+                  <Typography variant="h6" gutterBottom>
+                    Generering
+                  </Typography>
+                  <Box sx={{ mb: 2 }}>
+                    <Chip
+                      icon={generateStatus.isGenerating ? <CircularProgress size={16} /> : <CheckIcon />}
+                      label={generateStatus.isGenerating ? 'Pågår' : 'Redo'}
+                      color={generateStatus.isGenerating ? 'warning' : 'success'}
+                      size="small"
+                    />
+                  </Box>
+                  {generateStatus.lastGenerateCompleted && (
+                    <Typography variant="body2" color="text.secondary">
+                      Senast: {new Date(generateStatus.lastGenerateCompleted).toLocaleString('sv-SE')}
+                    </Typography>
+                  )}
+                  {generateStatus.error && (
+                    <Alert severity="error" sx={{ mt: 1 }}>
+                      {generateStatus.error}
+                    </Alert>
+                  )}
+                </CardContent>
+              </Card>
+            </Grid>
+
+            <Grid item xs={12} md={6}>
+              <Card variant="outlined">
+                <CardContent>
+                  <Typography variant="h6" gutterBottom>
+                    Uppdatering
+                  </Typography>
+                  <Box sx={{ mb: 2 }}>
+                    <Chip
+                      icon={updateStatus.isUpdating ? <CircularProgress size={16} /> : <CheckIcon />}
+                      label={updateStatus.isUpdating ? 'Pågår' : 'Redo'}
+                      color={updateStatus.isUpdating ? 'warning' : 'success'}
+                      size="small"
+                    />
+                  </Box>
+                  {updateStatus.lastUpdateCompleted && (
+                    <Typography variant="body2" color="text.secondary">
+                      Senast: {new Date(updateStatus.lastUpdateCompleted).toLocaleString('sv-SE')}
+                    </Typography>
+                  )}
+                  {updateStatus.error && (
+                    <Alert severity="error" sx={{ mt: 1 }}>
+                      {updateStatus.error}
+                    </Alert>
+                  )}
+                </CardContent>
+              </Card>
+            </Grid>
+          </Grid>
+        </Box>
+      </Paper>
     </Container>
-  );
+  )
 }
 
-export default App;
+export default App
